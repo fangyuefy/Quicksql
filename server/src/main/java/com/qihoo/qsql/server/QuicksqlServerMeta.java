@@ -2,6 +2,8 @@ package com.qihoo.qsql.server;
 
 import static org.apache.calcite.avatica.remote.MetricsHelper.concat;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.google.common.base.Optional;
 import com.google.common.cache.Cache;
 import com.google.common.cache.CacheBuilder;
@@ -14,7 +16,11 @@ import com.qihoo.qsql.api.SqlRunner.Builder.RunnerType;
 import com.qihoo.qsql.client.QuicksqlConnectionImpl;
 import com.qihoo.qsql.client.QuicksqlResultSet;
 import com.qihoo.qsql.client.QuicksqlResultSet.QueryResult;
+import com.qihoo.qsql.common.ErrorCode;
+import com.qihoo.qsql.model.ResultBean;
 import com.qihoo.qsql.org.apache.calcite.tools.YmlUtils;
+import com.qihoo.qsql.util.LogUtils;
+import com.qihoo.qsql.util.SecurityUtils;
 import com.qihoo.qsql.utils.HttpUtils;
 import com.qihoo.qsql.utils.SqlUtil;
 import java.lang.reflect.InvocationTargetException;
@@ -754,9 +760,12 @@ public class QuicksqlServerMeta implements ProtobufMeta {
             throw new NoSuchStatementException(h);
         }
         String sql = h.signature.sql;
+        String[] split = sql.split("<Quciksql>");
+        sql = split[0];
         for (TypedValue value : parameterValues) {
-            if (value.type == Rep.BYTE || value.type == Rep.SHORT || value.type == Rep.LONG || value.type == Rep.DOUBLE
-                || value.type == Rep.INTEGER || value.type == Rep.FLOAT) {
+            if (value.type == ColumnMetaData.Rep.BYTE || value.type == ColumnMetaData.Rep.SHORT
+                || value.type == ColumnMetaData.Rep.LONG || value.type == ColumnMetaData.Rep.DOUBLE
+                || value.type == ColumnMetaData.Rep.INTEGER || value.type == ColumnMetaData.Rep.FLOAT) {
                 sql = sql.replaceFirst("\\?", value.value.toString());
             } else {
                 sql = sql.replaceFirst("\\?", "'" + value.value.toString() + "'");
@@ -764,13 +773,31 @@ public class QuicksqlServerMeta implements ProtobufMeta {
         }
         ExecuteResult executeResult = null;
         try {
-            QuicksqlConnectionImpl connection = (QuicksqlConnectionImpl) getConnection(h.connectionId);
-            String jdbcUrl = connection.getInfoByName("jdbcUrl");
+            final QuicksqlConnectionImpl connection = (QuicksqlConnectionImpl) this.getConnection(h.connectionId);
+            final String jdbcUrl = connection.getInfoByName("jdbcUrl");
             if (StringUtils.isNotBlank(jdbcUrl)) {
-                executeResult = jdbcExecute(h, jdbcUrl, connection.getInfoByName("user"), connection
+                Map<String, String> clientParams = new HashMap<String, String>();
+                if (split.length == 2) {
+                    ObjectMapper mapper = new ObjectMapper();
+                    clientParams = mapper.readValue(split[1], new TypeReference<HashMap<String, String>>(){});
+                }
+                ResultBean resultBean = SecurityUtils.getSecurityCheck(sql);
+                if (resultBean.getCode().equals(ErrorCode.ERROR.code)) {
+                    throw new RuntimeException(resultBean.getMessage());
+                }
+                sql = sql.toLowerCase();
+                Map<String, String> sourceMap = getDataSourceInfo(jdbcUrl);
+                LogUtils.sendCollectLog("security_test", sourceMap.get("dbName"), sourceMap.get("driverName"),sourceMap.get("dbHost"),
+                    sourceMap.get("dbPort"), clientParams.get("serverIp"),clientParams.get("userIp"), clientParams.get("userCookie"), clientParams.get("serverName"), sql, Integer.valueOf(0),
+                    "running", h.connectionId + "-" + h.id, Integer.valueOf(1),
+                    Long.valueOf(System.currentTimeMillis()), null);
+                executeResult = this.jdbcExecute(h, jdbcUrl, connection.getInfoByName("user"), connection
                     .getInfoByName("password"), sql);
+                LogUtils.sendCollectLog("security_test", null,null, null, null,
+                    null, null,  null, null, sql, Integer.valueOf(1), "success",
+                    h.connectionId + "-" + h.id, null,  null, Long.valueOf(System.currentTimeMillis()));
             } else {
-                executeResult = getExecuteResultSet(h, connection, sql);
+                executeResult = this.getExecuteResultSet(h, connection, sql);
             }
         } catch (Exception e) {
             e.printStackTrace();
@@ -778,6 +805,48 @@ public class QuicksqlServerMeta implements ProtobufMeta {
         }
         return executeResult;
     }
+
+    public static Map<String, String> getDataSourceInfo(String jdbcUrl) {
+        String driverName = "";
+        String host = "";
+        String port = "";
+        String dbName = "";
+        Map<String, String> params = new HashMap<>();
+        int pos1;
+        if (jdbcUrl == null || !jdbcUrl.startsWith("jdbc:") || (pos1 = jdbcUrl.indexOf(58, 5)) == -1) {
+            throw new IllegalArgumentException("Invalid JDBC url.");
+        }
+        driverName = jdbcUrl.substring(5, pos1);
+        int pos2;
+        String connUri;
+        if ((pos2 = jdbcUrl.indexOf(59, pos1)) == -1) {
+            connUri = jdbcUrl.substring(pos1 + 1);
+        } else {
+            connUri = jdbcUrl.substring(pos1 + 1, pos2);
+        }
+        if (connUri.startsWith("//")) {
+            int pos3;
+            if ((pos3 = connUri.indexOf(47, 2)) != -1) {
+                host = connUri.substring(2, pos3);
+                dbName = connUri.substring(pos3 + 1);
+                if ((pos3 = host.indexOf(58)) != -1) {
+                    port = host.substring(pos3 + 1);
+                    host = host.substring(0, pos3);
+                }
+            }
+        } else {
+            dbName = connUri;
+        }
+        if (dbName.contains("?")) {
+            dbName = dbName.split("\\?")[0];
+        }
+        params.put("driverName", driverName);
+        params.put("dbHost", host);
+        params.put("dbPort", port);
+        params.put("dbName", dbName);
+        return params;
+    }
+
 
     @SuppressWarnings("deprecation")
     public ExecuteResult prepareAndExecute(StatementHandle h, String sql,
@@ -1431,6 +1500,10 @@ public class QuicksqlServerMeta implements ProtobufMeta {
             }
         }
     }
+
+
+    }
+
 }
 
 // End QuicksqlServerMeta.java

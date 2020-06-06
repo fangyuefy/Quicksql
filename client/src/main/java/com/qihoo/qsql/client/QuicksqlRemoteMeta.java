@@ -1,11 +1,14 @@
 package com.qihoo.qsql.client;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import java.sql.SQLException;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import javax.servlet.http.HttpServletRequest;
 import org.apache.calcite.avatica.AvaticaConnection;
 import org.apache.calcite.avatica.AvaticaConnection.CallableWithoutException;
 import org.apache.calcite.avatica.AvaticaParameter;
@@ -218,16 +221,31 @@ class QuicksqlRemoteMeta extends MetaImpl {
 
   @Override public StatementHandle prepare(final ConnectionHandle ch, final String sql,
       final long maxRowCount) {
-    return connection.invokeWithRetries(
-        new CallableWithoutException<StatementHandle>() {
-          public StatementHandle call() {
-            connectionSync(ch,
-                new ConnectionPropertiesImpl()); // sync connection state if necessary
-            final Service.PrepareResponse response = service.apply(
-                new Service.PrepareRequest(ch.id, sql, maxRowCount));
-            return response.statement;
+      final HttpServletRequest request = RequestManager.getHttpServletRequest();
+      String json = "";
+      if (request != null) {
+          final Map<String, String> params = new HashMap<String, String>();
+          params.put("serverIp", request.getRemoteAddr());
+          params.put("userIp", request.getRemoteAddr());
+          params.put("username", request.getParameter("username"));
+          params.put("serverName", request.getServerName());
+          params.put("getRemoteUser", request.getRemoteUser());
+          params.put("userCookie", request.getHeader("Cookie"));
+          ObjectMapper mapper = new ObjectMapper();
+          try {
+              json = mapper.writeValueAsString(params);
+          } catch (JsonProcessingException e) {
+              e.printStackTrace();
           }
-        });
+      }
+      String newSql = sql + "<Quciksql>" + json;
+      return (Meta.StatementHandle)this.connection.invokeWithRetries((AvaticaConnection.CallableWithoutException)new AvaticaConnection.CallableWithoutException<Meta.StatementHandle>() {
+          public Meta.StatementHandle call() {
+              QuicksqlRemoteMeta.this.connectionSync(ch, (Meta.ConnectionProperties)new ConnectionPropertiesImpl());
+              final Service.PrepareResponse response = QuicksqlRemoteMeta.this.service.apply(new Service.PrepareRequest(ch.id, newSql, maxRowCount));
+              return response.statement;
+          }
+      });
   }
 
   @SuppressWarnings("deprecation")
